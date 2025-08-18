@@ -39,6 +39,78 @@ struct Args {
     /// The RTT down channel to use for writing to the target.
     #[arg(long, default_value_t = 0)]
     down_channel: usize,
+
+    /// Use stdio instead of a PTY.
+    #[arg(long)]
+    stdio: bool,
+}
+
+fn rtt_bridge<R: Read, W: Write>(
+    core: &mut probe_rs::Core,
+    rtt: &mut Rtt,
+    up_channel: usize,
+    down_channel: usize,
+    mut reader: R,
+    mut writer: W,
+    running: &AtomicBool,
+) -> Result<()> {
+    let mut rtt_buf = [0u8; 1024];
+    let mut host_buf = [0u8; 1024];
+
+    while running.load(Ordering::SeqCst) {
+        // RTT -> Host
+        match rtt
+            .up_channels()
+            .get_mut(up_channel)
+            .unwrap()
+            .read(core, &mut rtt_buf)
+        {
+            Ok(count) if count > 0 => {
+                if writer.write_all(&rtt_buf[..count]).is_err() {
+                    eprintln!("Error writing to host. Exiting.");
+                    break;
+                }
+            }
+            Ok(_) => {
+                // No data.
+            }
+            Err(e) => {
+                eprintln!("Error reading from RTT: {}. Exiting.", e);
+                break;
+            }
+        }
+
+        // Host -> RTT
+        match reader.read(&mut host_buf) {
+            Ok(count) if count > 0 => {
+                if rtt
+                    .down_channels()
+                    .get_mut(down_channel)
+                    .unwrap()
+                    .write(core, &host_buf[..count])
+                    .is_err()
+                {
+                    eprintln!("Error writing to RTT. Exiting.");
+                    break;
+                }
+            }
+            Ok(_) => {
+                // No data.
+            }
+            Err(e) => {
+                // This can happen if the PTY is closed, or if stdin is non-blocking.
+                if e.kind() != std::io::ErrorKind::WouldBlock {
+                    eprintln!("Error reading from host: {}. Exiting.", e);
+                    break;
+                }
+            }
+        }
+
+        // Sleep to avoid busy-looping.
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -77,15 +149,6 @@ fn main() -> Result<()> {
         args.down_channel
     );
 
-    // Create a new PTY.
-    let pty = PtyProcess::spawn(std::process::Command::new("sleep"))?;
-    let mut pty_master = pty.get_raw_handle()?;
-    let pty_name = pty.slave_name()?;
-    println!(
-        "You can now connect to this PTY with a serial terminal, e.g., 'minicom -D {}'",
-        pty_name
-    );
-
     // For graceful shutdown.
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
@@ -95,64 +158,64 @@ fn main() -> Result<()> {
     .context("Error setting Ctrl-C handler")?;
     let running = &*running;
 
-    println!("Starting RTT <-> PTY bridge. Press Ctrl-C to exit.");
-
     let mut core = session.core(args.core).context("Core not found")?;
 
-    let mut rtt_buf = [0u8; 1024];
-    let mut pty_buf = [0u8; 1024];
+    if args.stdio {
+        // Use stdio
+        println!("Using stdio for RTT.");
 
-    while running.load(Ordering::SeqCst) {
-        // RTT -> PTY
-        match rtt
-            .up_channels()
-            .get_mut(args.up_channel)
-            .unwrap()
-            .read(&mut core, &mut rtt_buf)
+        #[cfg(unix)]
         {
-            Ok(count) if count > 0 => {
-                if pty_master.write_all(&rtt_buf[..count]).is_err() {
-                    eprintln!("Error writing to PTY. Exiting.");
-                    break;
-                }
-            }
-            Ok(_) => {
-                // No data.
-            }
-            Err(e) => {
-                eprintln!("Error reading from RTT: {}. Exiting.", e);
-                break;
-            }
+            use nix::fcntl::{fcntl, FcntlArg, OFlag};
+            use std::os::unix::io::AsRawFd;
+            // Set stdin to non-blocking.
+            let fd = std::io::stdin().as_raw_fd();
+            let flags = fcntl(fd, FcntlArg::F_GETFL)?;
+            fcntl(
+                fd,
+                FcntlArg::F_SETFL(OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK),
+            )?;
+            println!("Set stdin to non-blocking.");
+        }
+        #[cfg(not(unix))]
+        {
+            println!("Warning: non-blocking stdin is only supported on unix-like systems. Stdin will be blocking, which may not be what you want.");
         }
 
-        // PTY -> RTT
-        match pty_master.read(&mut pty_buf) {
-            Ok(count) if count > 0 => {
-                if rtt
-                    .down_channels()
-                    .get_mut(args.down_channel)
-                    .unwrap()
-                    .write(&mut core, &pty_buf[..count])
-                    .is_err()
-                {
-                    eprintln!("Error writing to RTT. Exiting.");
-                    break;
-                }
-            }
-            Ok(_) => {
-                // No data.
-            }
-            Err(e) => {
-                // This can happen if the PTY is closed.
-                if e.kind() != std::io::ErrorKind::WouldBlock {
-                    eprintln!("Error reading from PTY: {}. Exiting.", e);
-                    break;
-                }
-            }
-        }
+        println!("Starting RTT <-> stdio bridge. Press Ctrl-C to exit.");
+        let stdin = std::io::stdin();
+        let stdout = std::io::stdout();
+        rtt_bridge(
+            &mut core,
+            &mut rtt,
+            args.up_channel,
+            args.down_channel,
+            &stdin,
+            &stdout,
+            running,
+        )?;
+    } else {
+        // Use PTY
+        // Create a new PTY.
+        let pty = PtyProcess::spawn(std::process::Command::new("sleep"))?;
+        let pty_master = pty.get_raw_handle()?;
+        let pty_name = pty.slave_name()?;
+        println!(
+            "You can now connect to this PTY with a serial terminal, e.g., 'minicom -D {}'",
+            pty_name
+        );
 
-        // Sleep to avoid busy-looping.
-        thread::sleep(Duration::from_millis(10));
+        println!("Starting RTT <-> PTY bridge. Press Ctrl-C to exit.");
+
+        rtt_bridge(
+            &mut core,
+            &mut rtt,
+            args.up_channel,
+            args.down_channel,
+            &pty_master,
+            &pty_master,
+            running,
+        )?;
     }
 
     println!("Exiting.");
