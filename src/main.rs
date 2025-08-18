@@ -70,6 +70,7 @@ fn rtt_bridge<R: Read, W: Write>(
                     eprintln!("Error writing to host. Exiting.");
                     break;
                 }
+                let _ = writer.flush();
             }
             Ok(_) => {
                 // No data.
@@ -100,8 +101,8 @@ fn rtt_bridge<R: Read, W: Write>(
             Err(e) => {
                 // This can happen if the PTY is closed, or if stdin is non-blocking.
                 if e.kind() != std::io::ErrorKind::WouldBlock {
-                    eprintln!("Error reading from host: {}. Exiting.", e);
-                    break;
+                    // eprintln!("Error reading from host: {}. Exiting.", e);
+                    // break;
                 }
             }
         }
@@ -131,6 +132,8 @@ fn main() -> Result<()> {
 
     println!("Attaching to the chip...");
     let mut session = probe.attach(&args.chip, Permissions::default())?;
+
+    session.core(args.core).context("Core not found")?.run()?;
 
     // Start RTT.
     println!("Starting RTT...");
@@ -166,20 +169,22 @@ fn main() -> Result<()> {
 
         #[cfg(unix)]
         {
-            use nix::fcntl::{fcntl, FcntlArg, OFlag};
+            use nix::fcntl::{FcntlArg, OFlag, fcntl};
             use std::os::unix::io::AsRawFd;
             // Set stdin to non-blocking.
-            let fd = std::io::stdin().as_raw_fd();
-            let flags = fcntl(fd, FcntlArg::F_GETFL)?;
+            let fd = std::io::stdin();
+            let flags = fcntl(&fd, FcntlArg::F_GETFL)?;
             fcntl(
-                fd,
+                &fd,
                 FcntlArg::F_SETFL(OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK),
             )?;
             println!("Set stdin to non-blocking.");
         }
         #[cfg(not(unix))]
         {
-            println!("Warning: non-blocking stdin is only supported on unix-like systems. Stdin will be blocking, which may not be what you want.");
+            println!(
+                "Warning: non-blocking stdin is only supported on unix-like systems. Stdin will be blocking, which may not be what you want."
+            );
         }
 
         println!("Starting RTT <-> stdio bridge. Press Ctrl-C to exit.");
