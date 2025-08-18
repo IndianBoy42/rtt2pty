@@ -7,12 +7,15 @@ use probe_rs::{
     rtt::{Rtt, ScanRegion, UpChannel},
 };
 use ptyprocess::PtyProcess;
-use std::io::{Read, Write};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
+use std::{
+    io::{Read, Write},
+    thread,
+};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -52,16 +55,15 @@ fn main() -> Result<()> {
         None
     };
     let probes = AllProbesLister::new().list(selector.as_ref());
-    let probe = probes.get(0).context("Debug probe not found")?.open()?;
+    let probe = probes.first().context("Debug probe not found")?.open()?;
 
     println!("Attaching to the chip...");
     let mut session = probe.attach(&args.chip, Permissions::default())?;
-    let memory_map = session.target().memory_map.clone();
 
     // Start RTT.
     println!("Starting RTT...");
     let mut rtt = Rtt::attach_region(
-        &mut session.core(args.core).context("Core not found"),
+        &mut session.core(args.core).context("Core not found")?,
         &ScanRegion::Ram,
     )?;
     ensure!(
