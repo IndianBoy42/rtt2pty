@@ -210,6 +210,32 @@ fn main() -> Result<()> {
             pty_name
         );
 
+        let mut symlink_path: Option<String> = None;
+        #[cfg(unix)]
+        {
+            for i in 0..256 {
+                let path = format!("/dev/ttyUSB{}", i);
+                if !std::path::Path::new(&path).exists() {
+                    match std::os::unix::fs::symlink(&pty_name, &path) {
+                        Ok(_) => {
+                            println!("Created symlink {} -> {}", path, pty_name);
+                            symlink_path = Some(path);
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "Could not create symlink {}: {}. Try running with sudo.",
+                                path, e
+                            );
+                        }
+                    }
+                    break;
+                }
+                if i == 255 {
+                    eprintln!("Could not find a free /dev/ttyUSBx device to create a symlink.");
+                }
+            }
+        }
+
         println!("Starting RTT <-> PTY bridge. Press Ctrl-C to exit.");
 
         rtt_bridge(
@@ -221,6 +247,16 @@ fn main() -> Result<()> {
             &pty_master,
             running,
         )?;
+
+        #[cfg(unix)]
+        {
+            if let Some(path) = symlink_path {
+                match std::fs::remove_file(&path) {
+                    Ok(_) => println!("Removed symlink {}.", path),
+                    Err(e) => eprintln!("Could not remove symlink {}: {}", path, e),
+                }
+            }
+        }
     }
 
     println!("Exiting.");
